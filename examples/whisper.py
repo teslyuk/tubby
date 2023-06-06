@@ -9,6 +9,18 @@ from typing import Optional
 
 #export PYTHONPATH="${PYTHONPATH}:/path/to/your/project/"
 
+class LayerNorm(nn.LayerNorm):
+  def forward(self, x: Tensor) -> Tensor:
+    return super().forward(x.float()).to(x.dtype)
+    
+class Linear(nn.Linear):
+  def forward(self, x: Tensor) -> Tensor:
+    return F.linear(x, self.weight.to(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
+  
+class Conv1D(nn.Conv1d):
+  def _conv_forward(self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
+    return super()._conv_forward(x.float(), weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
+  
 class MultiHeadAttention(nn.Module):
   def __init__(self, n_state: int, n_head: int):
     super().__init__()
@@ -47,6 +59,26 @@ class MultiHeadAttention(nn.Module):
     w = F.softmax(qk, dim=-1).to(q.dtype)
     return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
     
+    
+class ResidualAttentionBlock(nn.Module):
+  def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
+    super().__init__()
+    self.attn = MultiHeadAttention(n_state, n_head)
+    self.attn_ln = LayerNorm(n_state)
+    
+    self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attention else None
+    self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
+    
+    n_mlp = n_state * 4
+    self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state))
+    self.mlp_ln = LayerNorm(n_state)
+    
+  def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
+    x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+    if self.cross_attn:
+      x = x + self.cross_attn(self.cross_attn_ln(xa), xa, kv_cache=kv_cache)[0]
+    x = x + self.mlp(self.mlp_ln(x))
+    return x
     
 if __name__ == "__main__":
   FILENAME = pathlib.Path(__file__).parent.parent / "weights" / "whisper-tiny.en.pt"

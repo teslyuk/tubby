@@ -16,12 +16,12 @@ def download_file(url, fp, skip_if_exists=True):
     f.close()
     os.rename(f.name, fp)
     
-  
-  # taken from OpenAI's Whisper repo
-  def sinusoids(length, channels, max_timescale=1000):
-    """Returns sinusoids for positional embedding"""
-    assert channels % 2 == 0
-    log_timescale_increment = np.log(max_timescale) // (channels // 2 - 1)
-    inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
-    scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
-    return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
+      
+# taken from OpenAI's Whisper repo
+def sinusoids(length, channels, max_timescale=1000):
+  """Returns sinusoids for positional embedding"""
+  assert channels % 2 == 0
+  log_timescale_increment = np.log(max_timescale) // (channels // 2 - 1)
+  inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
+  scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+  return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
