@@ -1,14 +1,41 @@
 import torch
 import pathlib
+import numpy as np
 
 from extra.utils import download_file, sinusoids
 
 import torch.nn.functional as F
 from torch import Tensor, nn
-from typing import Optional
+from typing import Optional, Iterable, Dict
+from dataclasses import dataclass
 
 #export PYTHONPATH="${PYTHONPATH}:/path/to/your/project/"
 
+@dataclass
+class ModelDimensions:
+  n_mels: int
+  n_audio_ctx: int
+  n_audio_state: int
+  n_audio_head: int
+  n_audio_layer: int
+  n_vocab: int
+  n_text_ctx: int
+  n_text_state: int
+  n_text_head: int
+  n_text_layer: int
+
+class LayerNorm(nn.LayerNorm):
+  def forward(self, x: Tensor) -> Tensor:
+    return super().forward(x.float()).to(x.dtype)
+    
+class Linear(nn.Linear):
+  def forward(self, x: Tensor) -> Tensor:
+    return F.linear(x, self.weight.to(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
+  
+class Conv1D(nn.Conv1d):
+  def _conv_forward(self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
+    return super()._conv_forward(x.float(), weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
+  
 class MultiHeadAttention(nn.Module):
   def __init__(self, n_state: int, n_head: int):
     super().__init__()
@@ -48,9 +75,116 @@ class MultiHeadAttention(nn.Module):
     return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
     
     
+class ResidualAttentionBlock(nn.Module):
+  def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
+    super().__init__()
+    self.attn = MultiHeadAttention(n_state, n_head)
+    self.attn_ln = LayerNorm(n_state)
+    
+    self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attention else None
+    self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
+    
+    n_mlp = n_state * 4
+    self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state))
+    self.mlp_ln = LayerNorm(n_state)
+    
+  def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
+    x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+    if self.cross_attn:
+      x = x + self.cross_attn(self.cross_attn_ln(xa), xa, kv_cache=kv_cache)[0]
+    x = x + self.mlp(self.mlp_ln(x))
+    return x
+  
+class AudioEncoder(nn.Module):
+  def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+    super().__init__()
+    self.conv1 = Conv1D(n_mels, n_state, kernel_size=3, padding=1)
+    self.conv2 = Conv1D(n_state, n_state, kernel_size=3, stride=2, padding=1)
+    self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
+    
+    self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList([ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)])
+    self.ln_post = LayerNorm(n_state)
+    
+  def forward(self, x: Tensor):
+    """
+    x : torch.Tensor, shape = (batch_size, n_mels, n_ctx) 
+        the mel spectrogram of the audio
+    """
+    x = F.gelu(self.conv1(x))
+    x = F.gelu(self.conv2(x))
+    x = x.permute(0, 2, 1)
+    
+    assert x.shape[1:] == self.positional_embedding.shape, f"Expected shape {self.positional_embedding.shape}, got {x.shape[1:]}"
+    
+    for block in self.blocks:
+      x = block(x)
+      
+    x = self.ln_post(x)
+    return x
+    
+class TextDecoder(nn.Module):
+  def __init__(self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+    super().__init__()
+    self.token_embedding = nn.Embedding(n_vocab, n_state)
+    self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
+    self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList([ResidualAttentionBlock(n_state, n_head, cross_attention=True) for _ in range(n_layer)])
+    self.ln = LayerNorm(n_state)
+    mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
+    self.register_buffer("mask", mask, persistent=False)
+    
+  def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+    """
+    x : torch.LongTensor, shape = (batch_size, <= n_ctx)
+        the text tokens
+    xa : torch.Tensor, shape = (batch_size, n_mels, n_audio_ctx)
+        the encoded audio features to be attended on
+    """
+    offset = next(iter(kv_cache.values())).shape[1] if kv_cache is not None else 0
+    x = self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]]
+    x = x.to(xa.dtype)
+    for block in self.blocks:
+      x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+    x = self.ln(x)
+    logits = x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1).float()
+    return logits
+  
+class Whisper(nn.Module):
+  def __init__(self, dims: ModelDimensions):
+    super().__init__()
+    self.dims = dims
+    self.encoder = AudioEncoder(
+      self.dims.n_mels,
+      self.dims.n_audio_ctx,
+      self.dims.n_audio_state,
+      self.dims.n_audio_head,
+      self.dims.n_audio_layer,
+    )
+    self.decoder = TextDecoder(
+      self.dims.n_vocab,
+      self.dims.n_text_ctx,
+      self.dims.n_text_state,
+      self.dims.n_text_head,
+      self.dims.n_text_layer,
+    )
+    
+  def embed_audio(self, mel: torch.Tensor):
+    return self.encoder(mel)
+  
+  def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
+    return self.decoder(tokens, audio_features)
+  
+  def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+    return self.decoder(tokens, self.encoder(mel))
+    
+
 if __name__ == "__main__":
-  FILENAME = pathlib.Path(__file__).parent.parent / "weights" / "whisper-tiny.en.pt"
+  BASE = pathlib.Path(__file__).parent.parent / "weights"
+  FILENAME = BASE / "whisper-tiny.en.pt"
   download_file("https://openaipublic.azureedge.net/main/whisper/models/d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03/tiny.en.pt", FILENAME)
-  state_dict = torch.load(FILENAME)["model_state_dict"]
-  for k, v in state_dict.items():
-    print(k)
+  state = torch.load(FILENAME)
+  # print(state["dims"])
+  dims = ModelDimensions(**state["dims"])
+  model = Whisper(dims)
+  model.load_state_dict(state["model_state_dict"])
+  print(model)
+  
