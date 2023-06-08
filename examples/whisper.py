@@ -1,10 +1,12 @@
 import torch
 import pathlib
 import numpy as np
+import librosa
 
-from extra.utils import download_file, sinusoids
+from extra.utils import download_file, sinusoids, prep_audio, get_encoding
 
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from torch import Tensor, nn
 from typing import Optional, Iterable, Dict
 from dataclasses import dataclass
@@ -114,7 +116,8 @@ class AudioEncoder(nn.Module):
     x = F.gelu(self.conv2(x))
     x = x.permute(0, 2, 1)
     
-    assert x.shape[1:] == self.positional_embedding.shape, f"Expected shape {self.positional_embedding.shape}, got {x.shape[1:]}"
+    # assert x.shape[1:] == self.positional_embedding.shape, f"Expected shape {self.positional_embedding.shape}, got {x.shape[1:]}"
+    x = x + self.positional_embedding[:x.shape[1]]
     
     for block in self.blocks:
       x = block(x)
@@ -175,7 +178,6 @@ class Whisper(nn.Module):
   
   def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
     return self.decoder(tokens, self.encoder(mel))
-    
 
 if __name__ == "__main__":
   BASE = pathlib.Path(__file__).parent.parent / "weights"
@@ -186,5 +188,9 @@ if __name__ == "__main__":
   dims = ModelDimensions(**state["dims"])
   model = Whisper(dims)
   model.load_state_dict(state["model_state_dict"])
-  print(model)
+  
+  log_mel_spec = prep_audio("/Users/tesnik/Desktop/Workspace/tesnikzoo/data/f2bjrop1.1.wav")
+  enc = get_encoding(dims.n_vocab)
+  print(log_mel_spec.shape)
+  print(model.encoder(log_mel_spec.unsqueeze(0)).shape)
   
