@@ -3,7 +3,7 @@ import pathlib
 import numpy as np
 import librosa
 
-from extra.utils import download_file, sinusoids, prep_audio, get_encoding
+from extra.utils import download_file, sinusoids, prep_audio, get_encoding, load_audio, pad_or_trim, log_mel_spectrogram
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -75,8 +75,7 @@ class MultiHeadAttention(nn.Module):
     qk = qk.float()
     w = F.softmax(qk, dim=-1).to(q.dtype)
     return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
-    
-    
+        
 class ResidualAttentionBlock(nn.Module):
   def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
     super().__init__()
@@ -116,8 +115,8 @@ class AudioEncoder(nn.Module):
     x = F.gelu(self.conv2(x))
     x = x.permute(0, 2, 1)
     
-    # assert x.shape[1:] == self.positional_embedding.shape, f"Expected shape {self.positional_embedding.shape}, got {x.shape[1:]}"
-    x = x + self.positional_embedding[:x.shape[1]]
+    assert x.shape[1:] == self.positional_embedding.shape, f"Expected shape {self.positional_embedding.shape}, got {x.shape[1:]}"
+    x = x + self.positional_embedding
     
     for block in self.blocks:
       x = block(x)
@@ -179,6 +178,10 @@ class Whisper(nn.Module):
   def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
     return self.decoder(tokens, self.encoder(mel))
 
+def img(x):
+  plt.imshow(x.numpy())
+  plt.show()
+  
 if __name__ == "__main__":
   BASE = pathlib.Path(__file__).parent.parent / "weights"
   FILENAME = BASE / "whisper-tiny.en.pt"
@@ -189,8 +192,18 @@ if __name__ == "__main__":
   model = Whisper(dims)
   model.load_state_dict(state["model_state_dict"])
   
-  log_mel_spec = prep_audio("/Users/tesnik/Desktop/Workspace/tesnikzoo/data/f2bjrop1.1.wav")
+  mel_spec = load_audio("/Users/tesnik/Desktop/Workspace/tesnikzoo/data/audio.wav")
+  mel_spec = pad_or_trim(mel_spec)
+  mel_spec = log_mel_spectrogram(mel_spec)
+  print(mel_spec.shape)
+  dat = model.encoder(mel_spec.unsqueeze(0))
   enc = get_encoding(dims.n_vocab)
-  print(log_mel_spec.shape)
-  print(model.encoder(log_mel_spec.unsqueeze(0)).shape)
+  # lst = [enc._special_tokens["<|startoftranscript|>"]]
+  # dat = model.encoder(log_mel_spec.unsqueeze(0))
+  # for i in range(20):
+  #   text = torch.tensor([lst])
+  #   out = model.decoder(text, dat)
+  #   idx = out[0, -1].detach().numpy().argmax()
+  #   lst.append(idx)
+  #   print(enc.decode(lst))
   
