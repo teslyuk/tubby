@@ -3,3 +3,4 @@
 **/*.pyo
 weights/**
 data/**
+.DS_Store
