@@ -3,7 +3,7 @@ import pathlib
 import numpy as np
 import librosa
 
-from extra.utils import download_file, sinusoids, prep_audio, get_encoding, load_audio, pad_or_trim, log_mel_spectrogram
+from extra.utils import download_file, sinusoids, get_encoding, load_audio, pad_or_trim, log_mel_spectrogram
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -42,36 +42,34 @@ class MultiHeadAttention(nn.Module):
   def __init__(self, n_state: int, n_head: int):
     super().__init__()
     self.n_head = n_head
-    self.query = nn.Linear(n_state, n_state)
-    self.key = nn.Linear(n_state, n_state, bias=False)
-    self.value = nn.Linear(n_state, n_state)
-    self.out = nn.Linear(n_state, n_state)
-    
-  def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
+    self.query = Linear(n_state, n_state)
+    self.key = Linear(n_state, n_state, bias=False)
+    self.value = Linear(n_state, n_state)
+    self.out = Linear(n_state, n_state)
+
+  def forward(self,x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
     q = self.query(x)
-    
     if kv_cache is None or xa is None or self.key not in kv_cache:
       # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
       # otherwise, perform key/value projections for self- or cross-attention as usual.
-      k = self.key(xa if xa is not None else x)
-      v = self.value(xa if xa is not None else x)
+      k = self.key(x if xa is None else xa)
+      v = self.value(x if xa is None else xa)
     else:
       # for cross-attention, calculate keys and values once and reuse in subsequent calls.
       k = kv_cache[self.key]
       v = kv_cache[self.value]
-      
     wv, qk = self.qkv_attention(q, k, v, mask)
     return self.out(wv), qk
-  
+
   def qkv_attention(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
     n_batch, n_ctx, n_state = q.shape
-    scale = (n_state //  self.n_head) ** -0.25
+    scale = (n_state // self.n_head) ** -0.25
     q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3) * scale
     k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1) * scale
     v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
     qk = q @ k
     if mask is not None:
-      qk = qk + mask[:n_ctx, :n_ctx]
+        qk = qk + mask[:n_ctx, :n_ctx]
     qk = qk.float()
     w = F.softmax(qk, dim=-1).to(q.dtype)
     return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
@@ -81,18 +79,16 @@ class ResidualAttentionBlock(nn.Module):
     super().__init__()
     self.attn = MultiHeadAttention(n_state, n_head)
     self.attn_ln = LayerNorm(n_state)
-    
-    self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attention else None
+    self.cross_attn = (MultiHeadAttention(n_state, n_head) if cross_attention else None)
     self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
-    
     n_mlp = n_state * 4
     self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state))
     self.mlp_ln = LayerNorm(n_state)
-    
+
   def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
     x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
     if self.cross_attn:
-      x = x + self.cross_attn(self.cross_attn_ln(xa), xa, kv_cache=kv_cache)[0]
+      x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
     x = x + self.mlp(self.mlp_ln(x))
     return x
   
@@ -194,16 +190,28 @@ if __name__ == "__main__":
   
   mel_spec = load_audio("/Users/tesnik/Desktop/Workspace/tesnikzoo/data/audio.wav")
   mel_spec = pad_or_trim(mel_spec)
-  mel_spec = log_mel_spectrogram(mel_spec)
-  print(mel_spec.shape)
-  dat = model.encoder(mel_spec.unsqueeze(0))
+  mel_spec = log_mel_spectrogram(mel_spec).unsqueeze(0)
+  
   enc = get_encoding(dims.n_vocab)
-  # lst = [enc._special_tokens["<|startoftranscript|>"]]
-  # dat = model.encoder(log_mel_spec.unsqueeze(0))
-  # for i in range(20):
-  #   text = torch.tensor([lst])
-  #   out = model.decoder(text, dat)
-  #   idx = out[0, -1].detach().numpy().argmax()
-  #   lst.append(idx)
-  #   print(enc.decode(lst))
+  
+  audio_features = model.encoder(mel_spec)
+  tokens = [enc._special_tokens["<|startoftranscript|>"]]
+  # print(audio_features.shape)
+  # print(tokens)
+  # print(tokens.shape)
+  
+  res: str = ""
+  while True:
+    text = torch.tensor([tokens])
+    out = model.decoder(text, audio_features)
+    idx = out[0, -1].detach().numpy().argmax()
+    tokens.append(idx)
+    trascription = enc.decode(tokens)
+    
+    # bad code
+    if "<|endoftext|>" in trascription.split()[-1]:
+      res = trascription
+      break
+  
+  print(res)
   
