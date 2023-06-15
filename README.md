@@ -1,2 +1,2 @@
-# tesnikzoo
-A tiny zoo of Speech, NLP and CV deep learning models ❤️
+# tubby
+A random set of Speech, NLP and CV deep learning models ❤️
