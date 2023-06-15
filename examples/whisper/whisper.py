@@ -2,8 +2,10 @@ import torch
 import pathlib
 import numpy as np
 import librosa
+import multiprocessing
+import os
 
-from extra.utils import download_file, sinusoids, get_encoding, load_audio, pad_or_trim, log_mel_spectrogram
+from extra.utils import download_file, sinusoids, get_encoding, load_audio, pad_or_trim, log_mel_spectrogram, SAMPLE_RATE
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -178,8 +180,19 @@ def img(x):
   plt.imshow(x.numpy())
   plt.show()
   
+import sounddevice as sd
+from scipy.io.wavfile import write
+
+def record_audio(directory):
+  if not os.path.exists(directory):
+      os.makedirs(directory)
+  print(f"Recording. Speak now!")
+  recording = sd.rec(int(10 * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1)
+  sd.wait()  # Wait until recording is finished
+  write(directory + f"/sample.wav", SAMPLE_RATE, recording)
+
 if __name__ == "__main__":
-  BASE = pathlib.Path(__file__).parent.parent / "weights"
+  BASE = pathlib.Path(__file__).parent.parent.parent / "weights"
   FILENAME = BASE / "whisper-tiny.en.pt"
   download_file("https://openaipublic.azureedge.net/main/whisper/models/d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03/tiny.en.pt", FILENAME)
   state = torch.load(FILENAME)
@@ -188,7 +201,8 @@ if __name__ == "__main__":
   model = Whisper(dims)
   model.load_state_dict(state["model_state_dict"])
   
-  mel_spec = load_audio("/Users/tesnik/Desktop/Workspace/tesnikzoo/data/audio.wav")
+  record_audio('/Users/tesnik/Desktop/Workspace/tesnikzoo/data')
+  mel_spec = load_audio("/Users/tesnik/Desktop/Workspace/tesnikzoo/data/sample.wav")
   mel_spec = pad_or_trim(mel_spec)
   mel_spec = log_mel_spectrogram(mel_spec).unsqueeze(0)
   
