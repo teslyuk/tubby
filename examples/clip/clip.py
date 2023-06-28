@@ -238,7 +238,7 @@ class VisionTransformer(nn.Module):
     return x
     
 class CLIP(nn.Module):
-  def __init(self, 
+  def __init__(self, 
              embed_dim: int, 
              # vision
              image_resolution: int,
