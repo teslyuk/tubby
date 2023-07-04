@@ -7,6 +7,9 @@ from typing import Tuple, Union
 from extra.utils import download_file
 from torch import nn
 from collections import OrderedDict
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode
+from PIL import Image
+from text_tokenizer import TextTokenizer, tokenize
 
 _MODELS = {
     "RN50": "https://openaipublic.azureedge.net/clip/models/afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762/RN50.pt",
@@ -173,18 +176,16 @@ class ResidualAttentionBlock(nn.Module):
     super().__init__()
     self.attn = nn.MultiheadAttention(d_model, n_head)
     self.ln_1 = LayerNorm(d_model)
-    self.mlp = nn.Sequential(
-      OrderedDict(
-        ("c_fc", nn.Linear(d_model, d_model * 4)),
-        ("gelu", QuickGELU()),
-        ("c_proj", nn.Linear(d_model * 4, d_model))
-      )
-    )
+    self.mlp = nn.Sequential(OrderedDict([
+      ("c_fc", nn.Linear(d_model, d_model * 4)),
+      ("gelu", QuickGELU()),
+      ("c_proj", nn.Linear(d_model * 4, d_model))
+    ]))
     self.ln_2 = LayerNorm(d_model)
     self.attn_mask = attn_mask
     
   def attention(self, x: torch.Tensor):
-    self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask else None
+    self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
     return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
     
   def forward(self, x: torch.Tensor):
@@ -208,33 +209,33 @@ class VisionTransformer(nn.Module):
     self.input_resolution = input_resolution
     self.output_dim = output_dim
     self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
-    
+
     scale = width ** -0.5
     self.class_embedding = nn.Parameter(scale * torch.randn(width))
     self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
     self.ln_pre = LayerNorm(width)
-    
+
     self.transformer = Transformer(width, layers, heads)
-    
+
     self.ln_post = LayerNorm(width)
     self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
-    
+
   def forward(self, x: torch.Tensor):
-    x = self.conv1(x) # shape = [*, width, grid, grid]
-    x = x.reshape(x.shape[0], x.shape[1], -1) # shape = [*, width, grid ** 2]
-    x = x.permute(0, 2, 1) # shape = [*, grid ** 2, width]
-    x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1) # shape = [*, grid ** 2 + 1, width]
+    x = self.conv1(x)  # shape = [*, width, grid, grid]
+    x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+    x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+    x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
     x = x + self.positional_embedding.to(x.dtype)
     x = self.ln_pre(x)
-    
-    x = x.permute(1, 0, 2) # NLD -> LND
+
+    x = x.permute(1, 0, 2)  # NLD -> LND
     x = self.transformer(x)
-    x = x.permute(1, 0, 2) # LDN -> NLD
-    
+    x = x.permute(1, 0, 2)  # LND -> NLD
+
     x = self.ln_post(x[:, 0, :])
-    
+
     if self.proj is not None:
-      x = x @ self.proj
+        x = x @ self.proj
     return x
     
 class CLIP(nn.Module):
@@ -363,10 +364,104 @@ class CLIP(nn.Module):
     
     # shape = [global_batch_size, global_batch_size]
     return logits_per_image, logits_per_text
+  
+def convert_weights(model: nn.Module):
+  """Convert applicable model parameters to fp16"""
+  def _convert_weights_to_fp16(l):
+    if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+      l.weight.data = l.weight.data.half()
+      if l.bias is not None:
+        l.bias.data = l.bias.data.half()
+
+    if isinstance(l, nn.MultiheadAttention):
+      for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+        tensor = getattr(l, attr)
+        if tensor is not None:
+          tensor.data = tensor.data.half()
+
+    for name in ["text_projection", "proj"]:
+      if hasattr(l, name):
+        attr = getattr(l, name)
+        if attr is not None:
+          attr.data = attr.data.half()
+
+  model.apply(_convert_weights_to_fp16)
+  
+def preprocess_image(n_px):
+  def _convert_image_to_rgb(image):
+    return image.convert("RGB")
+
+  return Compose([
+    Resize(n_px, interpolation=InterpolationMode.BICUBIC),
+    CenterCrop(n_px),
+    _convert_image_to_rgb,
+    ToTensor(),
+    Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),  
+  ])
 
 if __name__ == "__main__":
   BASE = pathlib.Path(__file__).parent.parent.parent / "weights"
   FILENAME = BASE / "CLIP-ViT-B-32.pt"
   download_file(_MODELS["ViT-B/32"], FILENAME)
-  state_dict = torch.jit.load(FILENAME, map_location="cpu")
+  model = torch.jit.load(FILENAME, map_location="cpu")
+  device = "cuda" if torch.cuda.is_available() else "cpu"
+
+  state_dict = model.state_dict()
+  # print(state_dict)
+  # for k,v in state_dict.items():
+  #   print(k)
+
+  vision_width = state_dict["visual.conv1.weight"].shape[0]
+  vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+  vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
+  grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
+  image_resolution = vision_patch_size * grid_size
+  embed_dim = state_dict["text_projection"].shape[1]
+  context_length = state_dict["positional_embedding"].shape[0]
+  vocab_size = state_dict["token_embedding.weight"].shape[0]
+  transformer_width = state_dict["ln_final.weight"].shape[0]
+  transformer_heads = transformer_width // 64
+  transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks"))) 
   
+  clip_model = CLIP(
+                    embed_dim,
+                    image_resolution, 
+                    vision_layers, 
+                    vision_width, 
+                    vision_patch_size,
+                    context_length, 
+                    vocab_size, 
+                    transformer_width, 
+                    transformer_heads, 
+                    transformer_layers
+                )
+  
+  for key in ["input_resolution", "context_length", "vocab_size"]:
+    if key in state_dict:
+      del state_dict[key]
+  
+  convert_weights(clip_model)
+  clip_model.load_state_dict(state_dict=state_dict)
+  clip_model.eval()
+  
+  if str(device) == "cpu":
+    clip_model.float()
+  
+  transforms = preprocess_image(clip_model.visual.input_resolution)
+  tokenizer = TextTokenizer()
+  
+  class_labels = ["a photo of a dog", "a cartoon picture of a dog"]
+  
+  image = transforms(Image.open("/Users/tesnik/Desktop/Workspace/tubby/data/dog.png")).unsqueeze(0).to(device)
+  text = tokenize(tokenizer=tokenizer, texts=class_labels).to(device)
+  
+  # import tiktoken
+  # enc = tiktoken.get_encoding("cl100k_base")
+  # print(torch.tensor(enc.encode("a photo of a dog")))
+  
+  with torch.no_grad():
+    logits_per_image, logits_per_text = clip_model(image, text)
+    probs = logits_per_image.softmax(dim=-1).cpu().numpy()
+    
+  print("Label probs:", probs)
+  print(class_labels[np.argmax(probs, axis=-1)[0]])
